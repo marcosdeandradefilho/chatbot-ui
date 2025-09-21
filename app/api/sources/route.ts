@@ -3,8 +3,9 @@
 import type { NextRequest } from "next/server";
 import { NextResponse } from "next/server";
 
+// Garante que esta rota sempre rode no servidor e sem cache estático
 export const dynamic = "force-dynamic";
-// Use Node.js em vez de Edge para evitar limitações de rede/parsers
+// Usamos Node.js (não Edge) para evitar limitações de rede/parsers
 export const runtime = "nodejs";
 
 type Item = {
@@ -18,15 +19,18 @@ type Item = {
 };
 
 function email() {
+  // você já definiu CONTACT_MAIL na Vercel
   return process.env.CONTACT_MAIL || process.env.CONTACT_EMAIL || "";
 }
 
 function cleanClone<T>(v: T): T {
-  // garante que só dados serializáveis vão pro JSON
+  // garante que só dados serializáveis vão para o JSON
   return JSON.parse(JSON.stringify(v));
 }
 
-// ---------- OpenAlex ----------
+/* =========================
+   OpenAlex
+   ========================= */
 async function fetchOpenAlex(q: string, limit: number) {
   const mail = encodeURIComponent(email() || "contato@example.com");
   const url = `https://api.openalex.org/works?search=${encodeURIComponent(
@@ -62,18 +66,35 @@ async function fetchOpenAlex(q: string, limit: number) {
   }
 }
 
-// ---------- SciELO (API de busca pública) ----------
+/* =========================
+   SciELO (API pública de busca)
+   ========================= */
 async function fetchScielo(q: string, limit: number) {
-  // A API pública de busca é esta; funciona melhor que articlemeta pra pesquisa
   const url = `https://search.scielo.org/api/v1/?q=${encodeURIComponent(
     q
   )}&lang=pt&count=${limit}&output=site&format=json`;
 
+  const ua =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
+  const commonHeaders = {
+    Accept: "application/json",
+    "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
+    "User-Agent": ua,
+    Referer: "https://search.scielo.org/",
+  } as const;
+
   try {
-    const r = await fetch(url, {
-      headers: { Accept: "application/json" },
-      cache: "no-store",
-    });
+    // Tentativa principal
+    let r = await fetch(url, { headers: commonHeaders, cache: "no-store" });
+
+    // Fallback se tomar 403 (alguns pops pedem outro endpoint)
+    if (r.status === 403) {
+      const fallback = `https://search.scielo.org/?q=${encodeURIComponent(
+        q
+      )}&lang=pt&count=${limit}&format=json`;
+      r = await fetch(fallback, { headers: commonHeaders, cache: "no-store" });
+    }
+
     if (!r.ok) return { items: [] as Item[], error: `scielo_${r.status}` };
 
     const j: any = await r.json();
@@ -96,7 +117,9 @@ async function fetchScielo(q: string, limit: number) {
   }
 }
 
-// ---------- LexML (SRU + MODS) ----------
+/* =========================
+   LexML (SRU + MODS)
+   ========================= */
 function parseLexml(xml: string, limit: number): Item[] {
   const out: Item[] = [];
   const rec = /<record\b[\s\S]*?<\/record>/gi;
@@ -106,7 +129,9 @@ function parseLexml(xml: string, limit: number): Item[] {
     const title =
       chunk.match(/<mods:title>(.*?)<\/mods:title>/i)?.[1]?.replace(/\s+/g, " ").trim() || "";
     const url =
-      chunk.match(/<identifier[^>]*type="uri"[^>]*>(.*?)<\/identifier>/i)?.[1] || "";
+      chunk.match(/<identifier[^>]*type="uri"[^>]*>(.*?)<\/identifier>/i)?.[1] ||
+      chunk.match(/<identifier[^>]*type="url"[^>]*>(.*?)<\/identifier>/i)?.[1] ||
+      "";
     const y = chunk.match(/<mods:dateIssued>(\d{4})/i)?.[1];
     if (title) out.push({ source: "lexml", title, url, year: y ? Number(y) : undefined });
   }
@@ -114,15 +139,29 @@ function parseLexml(xml: string, limit: number): Item[] {
 }
 
 async function fetchLexml(q: string, limit: number) {
-  const url = `https://servicos.lexml.gov.br/sru/?operation=searchRetrieve&version=1.2&recordSchema=mods&maximumRecords=${limit}&startRecord=1&query=${encodeURIComponent(
+  const ua =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
+  const headers = {
+    Accept: "application/xml",
+    "User-Agent": ua,
+    "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
+  } as const;
+
+  const base = `servicos.lexml.gov.br/sru/?operation=searchRetrieve&version=1.2&recordSchema=mods&maximumRecords=${limit}&startRecord=1&query=${encodeURIComponent(
     q
   )}`;
 
   try {
-    const r = await fetch(url, {
-      headers: { Accept: "application/xml" },
-      cache: "no-store",
-    });
+    // 1ª tentativa: HTTPS
+    let r = await fetch(`https://${base}`, { headers, cache: "no-store" });
+
+    // Fallback se status ruim: tentar HTTP
+    if (!r.ok) {
+      try {
+        r = await fetch(`http://${base}`, { headers, cache: "no-store" });
+      } catch {}
+    }
+
     if (!r.ok) return { items: [] as Item[], error: `lexml_${r.status}` };
 
     const xml = await r.text();
@@ -132,7 +171,9 @@ async function fetchLexml(q: string, limit: number) {
   }
 }
 
-// ---------- Handler ----------
+/* =========================
+   Handler
+   ========================= */
 export async function GET(req: NextRequest) {
   try {
     const { searchParams } = new URL(req.url);
@@ -140,7 +181,11 @@ export async function GET(req: NextRequest) {
     const src = (searchParams.get("source") || "all").toLowerCase();
     const limit = Math.max(1, Math.min(10, Number(searchParams.get("limit")) || 5));
 
-    if (!q) return NextResponse.json({ ok: false, error: "missing_query", items: [] }, { status: 400 });
+    if (!q)
+      return NextResponse.json(
+        { ok: false, error: "missing_query", items: [] },
+        { status: 400 }
+      );
 
     const tasks: Promise<{ items: Item[]; error?: string }>[] = [];
     if (src === "all" || src === "openalex") tasks.push(fetchOpenAlex(q, limit));
@@ -156,7 +201,10 @@ export async function GET(req: NextRequest) {
       { headers: { "Cache-Control": "no-store" } }
     );
   } catch (e: any) {
-    // Nunca mostra a tela branca: sempre responde JSON
-    return NextResponse.json({ ok: false, error: `fatal_${e?.message || "unknown"}` }, { status: 500 });
+    // Nunca mostra tela branca; sempre responde JSON
+    return NextResponse.json(
+      { ok: false, error: `fatal_${e?.message || "unknown"}` },
+      { status: 500 }
+    );
   }
 }
