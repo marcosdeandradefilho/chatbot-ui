@@ -1,139 +1,114 @@
-// app/api/sources/route.ts
 import { NextRequest, NextResponse } from "next/server";
 
-// Use Node.js runtime (mais seguro para libs/regex/envs)
-export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+export const runtime = "edge";
 
-// URLs a partir das suas ENV VARS (com fallback seguro)
-const OPENALEX = (process.env.OPENALEX_API_URL || "https://api.openalex.org/").replace(/\/$/, "");
-const SCIELO = (process.env.SCIELO_API_URL || "https://articlemeta.scielo.org/api/v1/").replace(/\/$/, "");
-const LEXML  = (process.env.LEXML_SRU_URL  || "https://servicos.lexml.gov.br/sru/").replace(/\/$/, "");
-const MAIL   = process.env.CONTACT_MAIL || "contato@example.com";
+// URLs de fallback (caso a env não esteja setada)
+const OPENALEX = process.env.OPENALEX_API_URL || "https://api.openalex.org/";
+const SCIELO   = process.env.SCIELO_API_URL   || "https://articlemeta.scielo.org/api/v1/";
+const LEXML    = process.env.LEXML_SRU_URL    || "https://servicos.lexml.gov.br/sru/";
 
-type Source = "openalex" | "scielo" | "lexml" | "all";
-
-function clamp(n: number, min: number, max: number) {
-  return Math.max(min, Math.min(max, n));
-}
-function take<T>(arr: T[], limit: number) {
-  return arr.slice(0, limit);
-}
-
-/* ----------------- OpenAlex ----------------- */
-async function getOpenAlex(q: string, limit: number) {
-  try {
-    // OpenAlex recomenda incluir mailto no query string
-    const url = `${OPENALEX}/works?search=${encodeURIComponent(q)}&per-page=${limit}&mailto=${encodeURIComponent(MAIL)}`;
-    const res = await fetch(url, { cache: "no-store" });
-    if (!res.ok) throw new Error(`OpenAlex ${res.status}`);
-    const data = await res.json();
-
-    const items = (data?.results ?? []).map((w: any) => ({
-      source: "openalex",
-      title: w?.title ?? "",
-      url: w?.id ?? "",
-      year: w?.publication_year,
-      authors: Array.isArray(w?.authorships)
-        ? w.authorships.map((a: any) => a?.author?.display_name).filter(Boolean).join(", ")
-        : undefined,
-      abstract:
-        w?.abstract_inverted_index
-          ? Object.entries(w.abstract_inverted_index)
-              .flatMap(([word, idxs]: [string, any]) => Array((idxs as number[]).length).fill(word))
-              .join(" ")
-          : undefined,
-    }));
-
-    return take(items, limit);
-  } catch {
-    return [];
-  }
+// helper para responder JSON sempre
+function json(data: any, status = 200) {
+  return new NextResponse(JSON.stringify(data), {
+    status,
+    headers: {
+      "content-type": "application/json; charset=utf-8",
+      "cache-control": "no-store",
+    },
+  });
 }
 
-/* ----------------- SciELO (ArticleMeta) -----------------
-   O ArticleMeta tem variações. Tentamos /search e caímos para /article.
----------------------------------------------------------- */
-async function getSciELO(q: string, limit: number) {
-  try {
-    const base = SCIELO;
-    // 1ª tentativa: endpoint de busca
-    let res = await fetch(`${base}/search/?q=${encodeURIComponent(q)}&limit=${limit}`, { cache: "no-store" });
-
-    // fallback: filtra por título no /article
-    if (!res.ok) {
-      res = await fetch(`${base}/article/?title=${encodeURIComponent(q)}&limit=${limit}`, { cache: "no-store" });
-    }
-    if (!res.ok) throw new Error(`SciELO ${res.status}`);
-
-    const json = await res.json();
-    const docs = Array.isArray(json) ? json : (json?.objects || json?.results || []);
-    const items = (Array.isArray(docs) ? docs : []).map((d: any) => ({
-      source: "scielo",
-      title: d?.title ?? d?.titles?.[0]?.text ?? "",
-      url: d?.url ?? d?.pid ?? d?.code ?? "",
-      year: d?.year ?? d?.publication_year,
-      authors: Array.isArray(d?.authors) ? d.authors.map((a: any) => a?.name).filter(Boolean).join(", ") : undefined,
-      abstract: Array.isArray(d?.abstract)
-        ? (d.abstract.find((x: any) => x?.lang === "pt")?.text ?? d.abstract[0]?.text)
-        : d?.abstract,
-    }));
-
-    return take(items, limit);
-  } catch {
-    return [];
-  }
-}
-
-/* ----------------- LexML (SRU XML) ----------------- */
-async function getLexML(q: string, limit: number) {
-  try {
-    const url = `${LEXML}?operation=searchRetrieve&version=1.2&maximumRecords=${limit}&startRecord=1&query=${encodeURIComponent(q)}`;
-    const res = await fetch(url, { cache: "no-store" });
-    if (!res.ok) throw new Error(`LexML ${res.status}`);
-
-    const xml = await res.text();
-
-    // Extrai cada <record>...</record>
-    const records = xml.match(/<record>[\s\S]*?<\/record>/g) ?? [];
-    const items = records.slice(0, limit).map((rec) => {
-      const titleMatch =
-        rec.match(/<dc:title[^>]*>([\s\S]*?)<\/dc:title>/) ||
-        rec.match(/<title>([\s\S]*?)<\/title>/);
-      const urlMatch =
-        rec.match(/<identifier[^>]*>(https?:\/\/[^<]+)<\/identifier>/) ||
-        rec.match(/<dc:identifier[^>]*>(https?:\/\/[^<]+)<\/dc:identifier>/);
-
-      return {
-        source: "lexml",
-        title: titleMatch ? titleMatch[1].replace(/<[^>]+>/g, "").trim() : "Sem título",
-        url: urlMatch ? urlMatch[1] : "",
-      };
-    });
-
-    return take(items, limit);
-  } catch {
-    return [];
-  }
-}
-
-/* ----------------- Handler ----------------- */
 export async function GET(req: NextRequest) {
-  const { searchParams } = new URL(req.url);
-  const q = (searchParams.get("q") || "").trim();
-  const source = (searchParams.get("source") || "all") as Source;
-  const limit = clamp(parseInt(searchParams.get("limit") || "5", 10) || 5, 1, 20);
+  try {
+    const { searchParams } = new URL(req.url);
+    const q = (searchParams.get("q") || "").trim();
+    const source = (searchParams.get("source") || "all").toLowerCase();
+    const limit = Math.max(1, Math.min(parseInt(searchParams.get("limit") || "5", 10) || 5, 20));
 
-  if (!q) {
-    return NextResponse.json({ ok: false, error: "Parâmetro obrigatório: q" }, { status: 400 });
+    if (!q) return json({ ok: false, error: "Informe o parâmetro q" }, 400);
+
+    const promises: Promise<any[]>[] = [];
+    if (source === "openalex" || source === "all") promises.push(fetchOpenAlex(q, limit));
+    if (source === "scielo"   || source === "all") promises.push(fetchSciELO(q, limit));
+    if (source === "lexml"    || source === "all") promises.push(fetchLexML(q, limit));
+
+    // NUNCA falha geral: o que der erro é ignorado
+    const settled = await Promise.allSettled(promises);
+    const items = settled.flatMap(s => (s.status === "fulfilled" ? s.value : []));
+
+    return json({ ok: true, query: q, source, count: items.length, items });
+  } catch (e: any) {
+    return json({ ok: false, error: e?.message || "server_error" }, 500);
   }
+}
 
-  const promises: Promise<any[]>[] = [];
-  if (source === "all" || source === "openalex") promises.push(getOpenAlex(q, limit));
-  if (source === "all" || source === "scielo")   promises.push(getSciELO(q, limit));
-  if (source === "all" || source === "lexml")    promises.push(getLexML(q, limit));
+// ------------------ fontes ------------------
 
-  const results = await Promise.all(promises);
-  const items = results.flat();
+async function fetchOpenAlex(q: string, limit: number): Promise<any[]> {
+  // OpenAlex aceita identificação via ?mailto=... (funciona na Edge)
+  const mail = (process.env.CONTACT_MAIL || "").trim();
+  const mailParam = mail ? `&mailto=${encodeURIComponent(mail)}` : "";
+  const url = `${OPENALEX}works?search=${encodeURIComponent(q)}&per-page=${limit}${mailParam}`;
 
-  return NextResponse.json({ ok: true, query: q, count: items.length, items });
+  const res = await fetch(url, { cache: "no-store" });
+  if (!res.ok) throw new Error(`openalex_${res.status}`);
+
+  const data = await res.json();
+  const results = Array.isArray(data?.results) ? data.results : [];
+  return results.slice(0, limit).map((w: any) => ({
+    source: "openalex",
+    title: w?.title || "",
+    url: w?.id || "",
+    year: w?.publication_year ?? null,
+    authors: (w?.authorships || []).map((a: any) => a?.author?.display_name).filter(Boolean),
+    abstract:
+      w?.abstract_inverted_index
+        ? Object.keys(w.abstract_inverted_index).slice(0, 60).join(" ")
+        : "",
+  }));
+}
+
+async function fetchSciELO(q: string, limit: number): Promise<any[]> {
+  // Busca tolerante (título OU resumo). A API do ArticleMeta responde JSON.
+  const query = `ti:"${q}" OR ab:"${q}"`;
+  const url = `${SCIELO}article/?q=${encodeURIComponent(query)}&limit=${limit}`;
+
+  const res = await fetch(url, { cache: "no-store" });
+  if (!res.ok) throw new Error(`scielo_${res.status}`);
+
+  const data = await res.json();
+  const arr = Array.isArray(data?.objects) ? data.objects : (Array.isArray(data) ? data : []);
+  return arr.slice(0, limit).map((it: any) => ({
+    source: "scielo",
+    title: it?.title || it?.title_translated || "",
+    url: it?.pid || it?.doi || "",
+    year: it?.publication_year || it?.year || null,
+    authors: it?.authors || it?.author || [],
+    abstract: it?.abstract || it?.abstract_translated || "",
+  }));
+}
+
+async function fetchLexML(q: string, limit: number): Promise<any[]> {
+  // SRU do LexML (retorna XML). Extração simples com RegExp.
+  const url = `${LEXML}?operation=searchRetrieve&version=1.2&maximumRecords=${limit}&startRecord=1&query=${encodeURIComponent(q)}`;
+
+  const res = await fetch(url, { cache: "no-store" });
+  if (!res.ok) throw new Error(`lexml_${res.status}`);
+
+  const xml = await res.text();
+  const items: any[] = [];
+
+  const recordRe = /<record>[\s\S]*?<recordData>[\s\S]*?<\/recordData>[\s\S]*?<\/record>/gi;
+  const titleRe = /<mods:title>([^<]+)<\/mods:title>/i;
+  const idRe = /<mods:identifier[^>]*>([^<]+)<\/mods:identifier>/i;
+
+  let m: RegExpExecArray | null;
+  while ((m = recordRe.exec(xml)) && items.length < limit) {
+    const chunk = m[0];
+    const title = (titleRe.exec(chunk)?.[1] || "").trim();
+    const id = (idRe.exec(chunk)?.[1] || "").trim();
+    if (title) items.push({ source: "lexml", title, url: id });
+  }
+  return items;
 }
