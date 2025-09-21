@@ -4,17 +4,20 @@ import type { NextRequest } from "next/server";
 import { NextResponse } from "next/server";
 
 export const dynamic = "force-dynamic";
+// forçamos Node.js (nada de Edge por causa de fetches externos e parsers)
 export const runtime = "nodejs";
 
-// --------- Tipos ---------
+// -----------------------------
+// Tipos e utilitários
+// -----------------------------
 type Item = {
   source:
     | "openalex"
-    | "scielo"
-    | "openai_web"
-    | "serpapi_scholar"
     | "semanticscholar"
+    | "serpapi_scholar"
+    | "openai_web"
     | "perplexity"
+    | "scielo"
     | "lexml";
   title: string;
   url?: string;
@@ -24,51 +27,50 @@ type Item = {
   extra?: any;
 };
 
-type FetchResult = { items: Item[]; error?: string };
-
-// --------- Helpers ---------
-const email =
-  process.env.CONTACT_MAIL ||
-  process.env.CONTACT_EMAIL ||
-  "contato@example.com";
-
-const serpApiKey = process.env.SERPAPI_API_KEY || "";
-const s2Key = process.env.S2_API_KEY || "";
-const pplxKey = process.env.PPLX_API_KEY || "";
-
-function ua() {
-  // SciELO e outros rejeitam requisições sem UA decente.
-  return `Mozilla/5.0 (compatible; ResearchBot/1.0; +mailto:${email})`;
+function email() {
+  return process.env.CONTACT_MAIL || process.env.CONTACT_EMAIL || "";
 }
 
-function jsonClone<T>(v: T): T {
+function cleanClone<T>(v: T): T {
+  // garante que só dados serializáveis vão pro JSON
   return JSON.parse(JSON.stringify(v));
 }
 
-function n(x: any) {
-  const v = Number(x);
-  return Number.isFinite(v) ? v : undefined;
+function ua() {
+  // user-agent simples pra endpoints que bloqueiam requests “anônimos”
+  const mail = email();
+  return `Mozilla/5.0 (compatible; chatbot-ui/1.0; +${mail || "contact@example.com"})`;
 }
 
-// ============ OPENALEX ============
-async function fetchOpenAlex(q: string, limit: number): Promise<FetchResult> {
+// -----------------------------
+// OpenAlex
+// -----------------------------
+async function fetchOpenAlex(q: string, limit: number) {
+  const mail = encodeURIComponent(email() || "contato@example.com");
   const url = `https://api.openalex.org/works?search=${encodeURIComponent(
     q
-  )}&per-page=${limit}&mailto=${encodeURIComponent(email)}`;
+  )}&per-page=${limit}&mailto=${mail}`;
 
   try {
     const r = await fetch(url, {
-      headers: { Accept: "application/json", "User-Agent": ua() },
+      headers: {
+        Accept: "application/json",
+        "User-Agent": ua(),
+      },
       cache: "no-store",
     });
-    if (!r.ok) return { items: [], error: `openalex_${r.status}` };
+    if (!r.ok) return { items: [] as Item[], error: `openalex_${r.status}` };
 
-    const j = await r.json();
-    const items: Item[] = (j?.results ?? []).slice(0, limit).map((w: any) => ({
+    const j: any = await r.json();
+    const items: Item[] = (j?.results ?? []).map((w: any) => ({
       source: "openalex",
       title: w?.title ?? "",
-      url: w?.id ?? w?.host_venue?.url ?? "",
-      year: n(w?.publication_year),
+      url:
+        w?.primary_location?.landing_page_url ||
+        w?.id ||
+        w?.host_venue?.url ||
+        "",
+      year: Number(w?.publication_year) || undefined,
       authors:
         (w?.authorships ?? [])
           .map((a: any) => a?.author?.display_name)
@@ -78,384 +80,517 @@ async function fetchOpenAlex(q: string, limit: number): Promise<FetchResult> {
         : undefined,
       extra: { cited_by_count: w?.cited_by_count },
     }));
+
     return { items };
   } catch (e: any) {
-    return { items: [], error: `openalex_err_${e?.message || "x"}` };
+    return { items: [] as Item[], error: `openalex_err_${e?.message || "x"}` };
   }
 }
 
-// ============ SCIELO ============
-async function fetchScielo(q: string, limit: number): Promise<FetchResult> {
-  // 1) Busca pública JSON
-  const url1 = `https://search.scielo.org/api/v1/?q=${encodeURIComponent(
-    q
-  )}&lang=pt&count=${limit}&output=site&format=json`;
-
-  try {
-    let r = await fetch(url1, {
-      headers: {
-        Accept: "application/json",
-        "User-Agent": ua(),
-        Referer: "https://search.scielo.org/",
-      },
-      cache: "no-store",
-    });
-
-    // Alguns PoPs respondem 403 sem UA; tentamos novamente com outro header
-    if (r.status === 403) {
-      r = await fetch(url1, {
-        headers: {
-          Accept: "application/json",
-          "User-Agent": ua(),
-          "X-Requested-With": "XMLHttpRequest",
-        },
-        cache: "no-store",
-      });
-    }
-
-    if (!r.ok) return { items: [], error: `scielo_${r.status}` };
-
-    const j: any = await r.json();
-    const docs = j?.documents ?? j?.results ?? [];
-    const items: Item[] = docs.slice(0, limit).map((d: any) => ({
-      source: "scielo",
-      title: d?.title ?? d?.document?.title ?? "",
-      url: d?.link ?? d?.url ?? "",
-      year: n(d?.year),
-      authors: (d?.authors ?? [])
-        .map((a: any) => (typeof a === "string" ? a : a?.name))
-        .filter(Boolean),
-      snippet: d?.snippet || d?.content,
-    }));
-    return { items };
-  } catch (e: any) {
-    return { items: [], error: `scielo_err_${e?.message || "x"}` };
-  }
-}
-
-// ============ SERPAPI – WEB ============
-async function fetchSerpWeb(q: string, limit: number): Promise<FetchResult> {
-  if (!serpApiKey) return { items: [], error: "serpapi_missing_key" };
-
-  const url = `https://serpapi.com/search.json?engine=google&q=${encodeURIComponent(
-    q
-  )}&hl=pt-BR&num=${limit}&api_key=${encodeURIComponent(serpApiKey)}`;
-
-  try {
-    const r = await fetch(url, { headers: { "User-Agent": ua() }, cache: "no-store" });
-    if (!r.ok) return { items: [], error: `serpapi_${r.status}` };
-
-    const j: any = await r.json();
-    const results = j?.organic_results ?? [];
-    const items: Item[] = results.slice(0, limit).map((o: any) => ({
-      source: "openai_web",
-      title: o?.title || o?.link || "",
-      url: o?.link,
-      snippet: o?.snippet,
-    }));
-    return { items };
-  } catch (e: any) {
-    return { items: [], error: `serpapi_err_${e?.message || "x"}` };
-  }
-}
-
-// ============ SERPAPI – GOOGLE SCHOLAR ============
-async function fetchSerpScholar(q: string, limit: number): Promise<FetchResult> {
-  if (!serpApiKey) return { items: [], error: "serpapi_missing_key" };
-
-  const url = `https://serpapi.com/search.json?engine=google_scholar&q=${encodeURIComponent(
-    q
-  )}&hl=pt-BR&num=${limit}&api_key=${encodeURIComponent(serpApiKey)}`;
-
-  try {
-    const r = await fetch(url, { headers: { "User-Agent": ua() }, cache: "no-store" });
-    if (!r.ok) return { items: [], error: `scholar_${r.status}` };
-
-    const j: any = await r.json();
-    const results = j?.organic_results ?? j?.scholar_results ?? [];
-    const items: Item[] = results.slice(0, limit).map((o: any) => ({
-      source: "serpapi_scholar",
-      title: o?.title || "",
-      url: o?.link || o?.result_id || "",
-      year: n(o?.publication_info?.year),
-      authors:
-        (o?.publication_info?.authors ?? [])
-          .map((a: any) => a?.name)
-          .filter(Boolean) || [],
-      snippet: o?.snippet,
-    }));
-    return { items };
-  } catch (e: any) {
-    return { items: [], error: `scholar_err_${e?.message || "x"}` };
-  }
-}
-
-// ============ SEMANTIC SCHOLAR (S2) ============
-async function fetchSemanticScholar(q: string, limit: number): Promise<FetchResult> {
-  // Documentação: GET /graph/v1/paper/search?query=&limit=&fields=
+// -----------------------------
+// Semantic Scholar (S2) – usa S2_API_KEY se existir
+// -----------------------------
+async function fetchSemanticScholar(q: string, limit: number) {
+  const fields =
+    "title,year,authors,name,abstract,url,externalIds,citationCount";
   const url = `https://api.semanticscholar.org/graph/v1/paper/search?query=${encodeURIComponent(
     q
-  )}&limit=${limit}&fields=title,year,authors,url,abstract,citationCount`;
+  )}&limit=${limit}&fields=${encodeURIComponent(fields)}`;
 
   const headers: Record<string, string> = {
     Accept: "application/json",
     "User-Agent": ua(),
   };
-  if (s2Key) headers["x-api-key"] = s2Key;
+  if (process.env.S2_API_KEY) headers["x-api-key"] = process.env.S2_API_KEY!;
 
   try {
     const r = await fetch(url, { headers, cache: "no-store" });
-    if (!r.ok) {
-      const code = r.status;
-      // 401/403 geralmente indicam falta de S2_API_KEY válida
-      return { items: [], error: `semanticscholar_${code}` };
-    }
+    if (!r.ok)
+      return { items: [] as Item[], error: `semanticscholar_${r.status}` };
+
     const j: any = await r.json();
-    const data = j?.data ?? j?.papers ?? [];
-    const items: Item[] = data.slice(0, limit).map((p: any) => ({
-      source: "semanticscholar",
-      title: p?.title || "",
-      url: p?.url,
-      year: n(p?.year),
-      authors:
-        (p?.authors ?? []).map((a: any) => a?.name).filter(Boolean) || [],
-      snippet: p?.abstract,
-      extra: { citationCount: p?.citationCount },
-    }));
+    const items: Item[] = (j?.data ?? []).map((p: any) => {
+      const doi =
+        p?.externalIds?.DOI || p?.externalIds?.doi || p?.externalIds?.Doi;
+      const url = p?.url || (doi ? `https://doi.org/${doi}` : "");
+      return {
+        source: "semanticscholar",
+        title: p?.title || "",
+        url,
+        year: Number(p?.year) || undefined,
+        authors:
+        (p?.authors ?? [])
+            .map((a: any) => a?.name)
+            .filter(Boolean),
+        snippet: p?.abstract || undefined,
+        extra: { citationCount: p?.citationCount },
+      } as Item;
+    });
+
     return { items };
   } catch (e: any) {
-    return { items: [], error: `semanticscholar_err_${e?.message || "x"}` };
+    return {
+      items: [] as Item[],
+      error: `semanticscholar_err_${e?.message || "x"}`,
+    };
   }
 }
 
-// ============ PERPLEXITY ============
-async function fetchPerplexity(q: string, limit: number): Promise<FetchResult> {
-  if (!pplxKey) return { items: [], error: "perplexity_missing_key" };
+// -----------------------------
+// SerpAPI – Google Scholar
+// -----------------------------
+async function fetchSerpapiScholar(q: string, limit: number) {
+  if (!process.env.SERPAPI_API_KEY)
+    return { items: [] as Item[], error: "serpapi_missing_key" };
 
-  // Modelos “online” retornam citations; usamos o campo 'citations' se vier.
+  const url = `https://serpapi.com/search.json?engine=google_scholar&q=${encodeURIComponent(
+    q
+  )}&num=${limit}&api_key=${encodeURIComponent(process.env.SERPAPI_API_KEY!)}`;
+
+  try {
+    const r = await fetch(url, { headers: { "User-Agent": ua() }, cache: "no-store" });
+    if (!r.ok) return { items: [] as Item[], error: `serpapi_${r.status}` };
+    const j: any = await r.json();
+
+    const items: Item[] = (j?.organic_results ?? []).slice(0, limit).map((it: any) => ({
+      source: "serpapi_scholar",
+      title: it?.title || "",
+      url: it?.link || it?.result_id || "",
+      year: (() => {
+        // tenta extrair ano de publication_info.summary (ex.: "... - 2019 - ...")
+        const s = it?.publication_info?.summary || "";
+        const m = s.match(/\b(19|20)\d{2}\b/);
+        return m ? Number(m[0]) : undefined;
+      })(),
+      authors:
+        (it?.publication_info?.authors ?? [])
+          .map((a: any) => a?.name)
+          .filter(Boolean) || [],
+      snippet: it?.snippet || undefined,
+    }));
+
+    return { items };
+  } catch (e: any) {
+    return { items: [] as Item[], error: `serpapi_err_${e?.message || "x"}` };
+  }
+}
+
+// -----------------------------
+// OpenAI Web (fallback via Google – SerpAPI)
+// -----------------------------
+async function fetchOpenAIWeb(q: string, limit: number) {
+  // Implementação segura e que “funciona já”: usamos Google Web via SerpAPI como fallback para “openai_web”.
+  if (!process.env.SERPAPI_API_KEY)
+    return { items: [] as Item[], error: "serpapi_missing_key" };
+
+  const url = `https://serpapi.com/search.json?engine=google&q=${encodeURIComponent(
+    q
+  )}&num=${limit}&api_key=${encodeURIComponent(process.env.SERPAPI_API_KEY!)}`;
+
+  try {
+    const r = await fetch(url, { headers: { "User-Agent": ua() }, cache: "no-store" });
+    if (!r.ok) return { items: [] as Item[], error: `openai_web_${r.status}` };
+    const j: any = await r.json();
+
+    const items: Item[] = (j?.organic_results ?? []).slice(0, limit).map((it: any) => ({
+      source: "openai_web",
+      title: it?.title || "",
+      url: it?.link || "",
+      snippet: it?.snippet || undefined,
+    }));
+
+    return { items };
+  } catch (e: any) {
+    return { items: [] as Item[], error: `openai_web_err_${e?.message || "x"}` };
+  }
+}
+
+// -----------------------------
+// Perplexity (citations)
+// -----------------------------
+async function fetchPerplexity(q: string, limit: number) {
+  if (!process.env.PERPLEXITY_API_KEY)
+    return { items: [] as Item[], error: "perplexity_missing_key" };
+
+  // Modelos “sonar-*-online” retornam citações (links). Vamos extrair as URLs e montar itens.
   const url = "https://api.perplexity.ai/chat/completions";
   const body = {
-    model: "sonar-small-online", // compatível com citations
+    model: "sonar-small-online", // bom custo/benefício; pode trocar por "sonar-medium-online"
+    messages: [{ role: "user", content: q }],
     return_citations: true,
-    messages: [{ role: "user", content: `Liste ${limit} fontes úteis sobre: ${q}` }],
+    // para manter barato/rápido, não precisamos de streaming aqui
   };
 
   try {
     const r = await fetch(url, {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${pplxKey}`,
+        Authorization: `Bearer ${process.env.PERPLEXITY_API_KEY}`,
         "Content-Type": "application/json",
         "User-Agent": ua(),
       },
       body: JSON.stringify(body),
     });
-    if (!r.ok) return { items: [], error: `perplexity_${r.status}` };
+
+    if (!r.ok) return { items: [] as Item[], error: `perplexity_${r.status}` };
 
     const j: any = await r.json();
+
+    // As citações costumam vir em choices[0].message.citations (array de URLs)
     const citations: string[] =
-      j?.choices?.[0]?.message?.citations ??
-      j?.citations ??
+      j?.choices?.[0]?.message?.citations ||
+      j?.citations ||
+      j?.metadata?.citations ||
       [];
 
-    const items: Item[] = citations.slice(0, limit).map((u: string) => ({
+    const items: Item[] = citations.slice(0, limit).map((link: string, idx: number) => ({
       source: "perplexity",
-      title: u,
-      url: u,
+      title: `Fonte #${idx + 1}`,
+      url: link,
+      snippet: undefined,
     }));
+
     return { items };
   } catch (e: any) {
-    return { items: [], error: `perplexity_err_${e?.message || "x"}` };
+    return { items: [] as Item[], error: `perplexity_err_${e?.message || "x"}` };
   }
 }
 
-// ============ LEXML (SRU + CQL) ============
-// Constrói a query CQL aceitando múltiplos filtros.
-function buildLexmlCQL(params: URLSearchParams): { cql: string; ok: boolean; why?: string } {
-  const term = (params.get("term") || params.get("q") || "").trim();
-  const tipo = (params.get("tipo_documento") || "").trim(); // ex.: "Legislação"
-  const numero = (params.get("numero") || "").trim();
-  const ano = (params.get("ano") || "").trim(); // "2010-2015" ou "2020"
-  const localidade = (params.get("localidade") || "").trim();
-  const autoridade = (params.get("autoridade") || "").trim();
-  const excluir = (params.get("excluir") || "").trim();
+// -----------------------------
+// SciELO (API pública) com fallback OpenAlex
+// -----------------------------
+async function fetchScielo(q: string, limit: number) {
+  const api = `https://search.scielo.org/api/v1/?q=${encodeURIComponent(
+    q
+  )}&lang=pt&count=${limit}&output=site&format=json`;
 
-  const parts: string[] = [];
+  try {
+    const r = await fetch(api, {
+      headers: {
+        Accept: "application/json",
+        "Accept-Language": "pt-BR,pt;q=0.9",
+        Referer: "https://search.scielo.org/",
+        "User-Agent": ua(),
+        "Cache-Control": "no-store",
+      },
+    });
 
+    if (r.status === 403) {
+      // fallback para OpenAlex “forçando” resultados próximos a SciELO
+      const oaUrl = `https://api.openalex.org/works?search=${encodeURIComponent(
+        q + " scielo"
+      )}&per-page=${limit}`;
+      const oa = await fetch(oaUrl, {
+        headers: { Accept: "application/json", "User-Agent": ua() },
+        cache: "no-store",
+      });
+      if (!oa.ok) return { items: [] as Item[], error: "scielo_403" };
+      const j: any = await oa.json();
+      const items: Item[] = (j?.results ?? []).slice(0, limit).map((w: any) => ({
+        source: "scielo",
+        title: w?.title ?? "",
+        url:
+          w?.primary_location?.landing_page_url ||
+          w?.id ||
+          w?.host_venue?.url ||
+          "",
+        year: Number(w?.publication_year) || undefined,
+        authors:
+          (w?.authorships ?? [])
+            .map((a: any) => a?.author?.display_name)
+            .filter(Boolean) || [],
+        snippet: w?.abstract_inverted_index
+          ? Object.keys(w.abstract_inverted_index).slice(0, 40).join(" ")
+          : undefined,
+        extra: { via: "openalex_fallback" },
+      }));
+      return { items, error: "scielo_403" };
+    }
+
+    if (!r.ok) return { items: [] as Item[], error: `scielo_${r.status}` };
+
+    const j: any = await r.json();
+    const docs = j?.documents ?? j?.results ?? [];
+
+    const items: Item[] = docs.slice(0, limit).map((d: any) => ({
+      source: "scielo",
+      title: d?.title ?? d?.document?.title ?? "",
+      url: d?.link ?? d?.url ?? "",
+      year: Number(d?.year) || undefined,
+      authors: (d?.authors ?? [])
+        .map((a: any) => (typeof a === "string" ? a : a?.name))
+        .filter(Boolean),
+      snippet: d?.snippet || d?.content,
+    }));
+
+    return { items };
+  } catch (e: any) {
+    return { items: [] as Item[], error: `scielo_err_${e?.message || "x"}` };
+  }
+}
+
+// -----------------------------
+// LexML SRU – consulta com filtros avançados (recordSchema=dc)
+// -----------------------------
+function buildLexmlCQL(params: {
+  term?: string | null;
+  tipo_documento?: string | null;
+  numero?: string | null;
+  ano?: string | null; // “2020” ou “2010-2015”
+  localidade?: string | null;
+  autoridade?: string | null;
+  excluir?: string | null; // palavras separadas por vírgula ou espaço
+}) {
+  const {
+    term,
+    tipo_documento,
+    numero,
+    ano,
+    localidade,
+    autoridade,
+    excluir,
+  } = params;
+
+  const queryParts: string[] = [];
+
+  // termo em título/descrição
   if (term) {
-    parts.push(`(dc.title all "${term}" or dc.description all "${term}")`);
-  } else {
-    return { cql: "", ok: false, why: "missing_term" };
+    const t = term.trim();
+    if (t) queryParts.push(`(dc.title all "${t}" or dc.description all "${t}")`);
   }
 
-  if (tipo) {
-    // aceita múltiplos separados por vírgula
-    const tipos = tipo.split(",").map((t) => t.trim()).filter(Boolean);
-    if (tipos.length) {
-      const clause = tipos
-        .map((t) =>
-          t.includes(" ")
-            ? `facet-tipoDocumento all "${t}"`
-            : `facet-tipoDocumento any "${t}"`
-        )
-        .join(" or ");
-      parts.push(`(${clause})`);
-    }
-  }
-
-  if (numero) {
-    parts.push(`(urn any "${numero}" or dc.title any "${numero}")`);
-  }
-
-  if (ano) {
-    if (ano.includes("-")) {
-      const [a, b] = ano.replace(/\s/g, "").split("-");
-      const ai = parseInt(a || "");
-      const bi = parseInt(b || "");
-      if (Number.isFinite(ai) && Number.isFinite(bi)) {
-        parts.push(`(date >= "${ai}" and date <= "${bi}")`);
-      }
-    } else {
-      parts.push(`date any "${ano}"`);
-    }
-  }
-
-  if (localidade) {
-    parts.push(
-      localidade.includes(" ")
-        ? `localidade = "${localidade}"`
-        : `localidade any "${localidade}"`
-    );
-  }
-
-  if (autoridade) {
-    parts.push(
-      autoridade.includes(" ")
-        ? `autoridade = "${autoridade}"`
-        : `autoridade any "${autoridade}"`
-    );
-  }
-
-  if (excluir) {
-    const palavras = excluir
-      .split(/[,\s]+/)
-      .map((w) => w.trim())
+  // tipo de documento: pode vir com acentos; usamos “any/all”
+  if (tipo_documento) {
+    const raw = tipo_documento
+      .split(",")
+      .map((s) => s.trim())
       .filter(Boolean);
-    if (palavras.length) {
-      const nots = palavras
-        .map((p) =>
-          p.includes(" ")
-            ? `(dc.title all "${p}" or dc.description all "${p}")`
-            : `(dc.title any "${p}" or dc.description any "${p}")`
-        )
-        .join(" or ");
-      parts.push(`not (${nots})`);
+    if (raw.length) {
+      const clauses = raw.map((t) =>
+        t.includes(" ")
+          ? `facet-tipoDocumento all "${t}"`
+          : `facet-tipoDocumento any "${t}"`
+      );
+      queryParts.push(`(${clauses.join(" or ")})`);
     }
   }
 
-  return { cql: parts.join(" and "), ok: true };
+  // número
+  if (numero && numero.trim()) {
+    const num = numero.trim();
+    queryParts.push(`(urn any "${num}" or dc.title any "${num}")`);
+  }
+
+  // ano simples ou intervalo
+  if (ano && ano.trim()) {
+    const s = ano.trim();
+    if (s.includes("-")) {
+      const parts = s.replace(/\s+/g, "").split("-");
+      const y1 = Number(parts[0]);
+      const y2 = Number(parts[1]);
+      if (y1 && y2) queryParts.push(`(date >= "${y1}" and date <= "${y2}")`);
+    } else {
+      queryParts.push(`date any "${s}"`);
+    }
+  }
+
+  // localidade
+  if (localidade && localidade.trim()) {
+    const loc = localidade.trim();
+    queryParts.push(
+      loc.includes(" ") ? `localidade = "${loc}"` : `localidade any "${loc}"`
+    );
+  }
+
+  // autoridade
+  if (autoridade && autoridade.trim()) {
+    const auth = autoridade.trim();
+    queryParts.push(
+      auth.includes(" ")
+        ? `autoridade = "${auth}"`
+        : `autoridade any "${auth}"`
+    );
+  }
+
+  // excluir palavras
+  if (excluir && excluir.trim()) {
+    const arr =
+      excluir.indexOf(",") >= 0
+        ? excluir.split(",").map((s) => s.trim())
+        : excluir.split(/\s+/).map((s) => s.trim());
+    const exClauses = arr
+      .filter(Boolean)
+      .map((w) =>
+        w.includes(" ")
+          ? `dc.title all "${w}" or dc.description all "${w}"`
+          : `dc.title any "${w}" or dc.description any "${w}"`
+      );
+    if (exClauses.length) queryParts.push(`not (${exClauses.join(" or ")})`);
+  }
+
+  return queryParts.join(" and ");
 }
 
 function parseLexmlDC(xml: string, limit: number): Item[] {
-  // Parse simples por regex (suficiente pro DC de SRU):
-  const recRe = /<record\b[\s\S]*?<\/record>/gi;
-  const get = (s: string, re: RegExp) => s.match(re)?.[1]?.trim();
-
-  const items: Item[] = [];
+  // parse simples por regex (sem dependências)
+  const out: Item[] = [];
+  const rec = /<srw:record\b[\s\S]*?<\/srw:record>/gi;
   let m: RegExpExecArray | null;
-  while ((m = recRe.exec(xml)) && items.length < limit) {
+  while ((m = rec.exec(xml)) && out.length < limit) {
     const chunk = m[0];
 
     const title =
-      get(chunk, /<dc:title[^>]*>([\s\S]*?)<\/dc:title>/i) || "Sem título";
-    const urn = get(chunk, /<urn[^>]*>([\s\S]*?)<\/urn>/i) || "";
-    const url = urn ? `https://www.lexml.gov.br/urn/${urn}` : undefined;
-    const year = n(get(chunk, /<dc:date[^>]*>(\d{4})/i));
-    const desc = get(chunk, /<dc:description[^>]*>([\s\S]*?)<\/dc:description>/i);
+      chunk.match(/<dc:title[^>]*>([\s\S]*?)<\/dc:title>/i)?.[1]?.replace(/\s+/g, " ").trim() ||
+      "";
 
-    items.push({
-      source: "lexml",
-      title,
-      url,
-      year,
-      snippet: desc,
-      extra: { urn },
-    });
+    // tentamos pegar “urn” ou dc:identifier com urn
+    const urn =
+      chunk.match(/<urn[^>]*>([\s\S]*?)<\/urn>/i)?.[1]?.trim() ||
+      chunk.match(/<dc:identifier[^>]*>(urn:[^<]+)<\/dc:identifier>/i)?.[1] ||
+      "";
+
+    const desc =
+      chunk
+        .match(/<dc:description[^>]*>([\s\S]*?)<\/dc:description>/gi)
+        ?.map((x) => x.replace(/<[^>]+>/g, "").trim())
+        ?.filter(Boolean) ?? [];
+    const resumo = desc.length ? desc[0] : "";
+
+    // ano: alguns registros têm <dc:date> ou “date” noutro namespace; tentamos 4 dígitos
+    const yMatch =
+      chunk.match(/<dc:date[^>]*>(\d{4})/i)?.[1] ||
+      chunk.match(/\b(19|20)\d{2}\b/)?.[0] ||
+      undefined;
+
+    const url = urn ? `https://www.lexml.gov.br/urn/${urn}` : undefined;
+
+    if (title) {
+      out.push({
+        source: "lexml",
+        title,
+        url,
+        year: yMatch ? Number(yMatch) : undefined,
+        authors: undefined,
+        snippet: resumo || undefined,
+      });
+    }
   }
-  return items;
+  return out;
 }
 
-async function fetchLexml(params: URLSearchParams, limit: number): Promise<FetchResult> {
-  const { cql, ok, why } = buildLexmlCQL(params);
-  if (!ok) return { items: [], error: why || "lexml_missing_term" };
+async function fetchLexmlAdvanced(
+  params: {
+    term?: string | null;
+    tipo_documento?: string | null;
+    numero?: string | null;
+    ano?: string | null;
+    localidade?: string | null;
+    autoridade?: string | null;
+    excluir?: string | null;
+  },
+  limit: number
+) {
+  const cql = buildLexmlCQL(params);
+  if (!cql) return { items: [] as Item[], error: "lexml_missing_filters" };
 
-  const url = `https://www.lexml.gov.br/busca/SRU?operation=searchRetrieve&version=1.1&query=${encodeURIComponent(
-    cql
-  )}&maximumRecords=${limit}&startRecord=1&recordSchema=dc`;
+  const base = "https://www.lexml.gov.br/busca/SRU";
+  const url =
+    base +
+    `?operation=searchRetrieve&version=1.1&recordSchema=dc&maximumRecords=${limit}&startRecord=1&query=${encodeURIComponent(
+      cql
+    )}`;
 
   try {
     const r = await fetch(url, {
-      headers: { Accept: "application/xml", "User-Agent": ua() },
-      cache: "no-store",
+      headers: {
+        Accept: "application/xml",
+        "User-Agent": ua(),
+        "Cache-Control": "no-store",
+      },
     });
-    if (!r.ok) return { items: [], error: `lexml_${r.status}` };
+    if (!r.ok) return { items: [] as Item[], error: `lexml_${r.status}` };
 
     const xml = await r.text();
     const items = parseLexmlDC(xml, limit);
     return { items };
   } catch (e: any) {
-    return { items: [], error: `lexml_err_${e?.message || "x"}` };
+    return { items: [] as Item[], error: `lexml_err_${e?.message || "x"}` };
   }
 }
 
-// ============ HANDLER ============
+// -----------------------------
+// Handler
+// -----------------------------
 export async function GET(req: NextRequest) {
   try {
-    const url = new URL(req.url);
-    const sp = url.searchParams;
+    const { searchParams } = new URL(req.url);
 
-    // Para fontes "normais", usamos q. Para LexML, aceitamos q OU term.
-    const src = (sp.get("source") || "all").toLowerCase();
-    const qRaw = sp.get("q") || "";
-    const limit = Math.max(1, Math.min(10, Number(sp.get("limit")) || 5));
+    // fontes
+    const src = (searchParams.get("source") || "all").toLowerCase();
 
-    const errors: string[] = [];
-    const jobs: Promise<FetchResult>[] = [];
+    // consulta principal (para todas as fontes, exceto LexML que aceita “term” e filtros)
+    const q = (searchParams.get("q") || "").trim();
 
-    const want = (name: string) => src === "all" || src === name;
+    // LexML filtros dedicados
+    const lexmlParams = {
+      term: (searchParams.get("term") || "").trim() || q || null,
+      tipo_documento: searchParams.get("tipo_documento"),
+      numero: searchParams.get("numero"),
+      ano: searchParams.get("ano"),
+      localidade: searchParams.get("localidade"),
+      autoridade: searchParams.get("autoridade"),
+      excluir: searchParams.get("excluir"),
+    };
 
-    // Exigir termo quando não for LexML
-    if (!qRaw && src !== "lexml") {
+    // limit
+    const limit = Math.max(1, Math.min(10, Number(searchParams.get("limit")) || 5));
+
+    // validação mínima:
+    if (
+      !q &&
+      !(
+        src === "lexml" &&
+        (lexmlParams.term || lexmlParams.tipo_documento || lexmlParams.numero)
+      )
+    ) {
+      // se LexML, aceitamos “term” no lugar de q; caso contrário, exigimos q
       return NextResponse.json(
         { ok: false, error: "missing_query", items: [] },
         { status: 400 }
       );
     }
 
-    if (want("openalex")) jobs.push(fetchOpenAlex(qRaw, limit));
-    if (want("scielo")) jobs.push(fetchScielo(qRaw, limit));
-    if (want("openai_web")) jobs.push(fetchSerpWeb(qRaw, limit));
-    if (want("serpapi_scholar")) jobs.push(fetchSerpScholar(qRaw, limit));
-    if (want("semanticscholar")) jobs.push(fetchSemanticScholar(qRaw, limit));
-    if (want("perplexity")) jobs.push(fetchPerplexity(qRaw, limit));
-    if (want("lexml")) jobs.push(fetchLexml(sp, limit)); // usa term/q + filtros
+    const tasks: Promise<{ items: Item[]; error?: string }>[] = [];
 
-    const all = await Promise.all(jobs);
-    const items = all.flatMap((r) => r.items);
-    all.forEach((r) => r.error && errors.push(r.error));
+    // seleção das fontes
+    const wants = (name: string) => src === "all" || src === name;
+
+    if (wants("openalex")) tasks.push(fetchOpenAlex(q || lexmlParams.term || "", limit));
+    if (wants("semanticscholar")) tasks.push(fetchSemanticScholar(q || lexmlParams.term || "", limit));
+    if (wants("serpapi_scholar")) tasks.push(fetchSerpapiScholar(q || lexmlParams.term || "", limit));
+    if (wants("openai_web")) tasks.push(fetchOpenAIWeb(q || lexmlParams.term || "", limit));
+    if (wants("perplexity")) tasks.push(fetchPerplexity(q || lexmlParams.term || "", limit));
+    if (wants("scielo")) tasks.push(fetchScielo(q || lexmlParams.term || "", limit));
+    if (wants("lexml"))
+      tasks.push(fetchLexmlAdvanced(lexmlParams, limit));
+
+    const results = await Promise.all(tasks);
+    const items = results.flatMap((r) => r.items);
+    const errors = results.map((r) => r.error).filter(Boolean) as string[];
 
     return NextResponse.json(
       {
         ok: true,
-        query: sp.get("term") || qRaw, // mostra term quando for lexml
+        query: q || lexmlParams.term || "",
         source: src,
         count: items.length,
         errors,
-        items: jsonClone(items),
+        items: cleanClone(items),
       },
       { headers: { "Cache-Control": "no-store" } }
     );
   } catch (e: any) {
+    // Nunca deixa tela branca
     return NextResponse.json(
       { ok: false, error: `fatal_${e?.message || "unknown"}` },
       { status: 500 }
