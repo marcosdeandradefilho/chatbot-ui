@@ -3,13 +3,13 @@
 import type { NextRequest } from "next/server";
 import { NextResponse } from "next/server";
 
-// Garante que esta rota sempre rode no servidor e sem cache estático
+// força execução no server e evita cache estático
 export const dynamic = "force-dynamic";
-// Usamos Node.js (não Edge) para evitar limitações de rede/parsers
+// usar Node.js (não Edge) para evitar limitações de rede/parsers
 export const runtime = "nodejs";
 
 type Item = {
-  source: "openalex" | "scielo" | "lexml";
+  source: "openalex" | "scielo" | "lexml" | "s2" | "scholar";
   title: string;
   url?: string;
   year?: number;
@@ -19,18 +19,16 @@ type Item = {
 };
 
 function email() {
-  // você já definiu CONTACT_MAIL na Vercel
   return process.env.CONTACT_MAIL || process.env.CONTACT_EMAIL || "";
 }
 
 function cleanClone<T>(v: T): T {
-  // garante que só dados serializáveis vão para o JSON
   return JSON.parse(JSON.stringify(v));
 }
 
-/* =========================
+/* =====================================
    OpenAlex
-   ========================= */
+   ===================================== */
 async function fetchOpenAlex(q: string, limit: number) {
   const mail = encodeURIComponent(email() || "contato@example.com");
   const url = `https://api.openalex.org/works?search=${encodeURIComponent(
@@ -66,9 +64,9 @@ async function fetchOpenAlex(q: string, limit: number) {
   }
 }
 
-/* =========================
+/* =====================================
    SciELO (API pública de busca)
-   ========================= */
+   ===================================== */
 async function fetchScielo(q: string, limit: number) {
   const url = `https://search.scielo.org/api/v1/?q=${encodeURIComponent(
     q
@@ -76,7 +74,7 @@ async function fetchScielo(q: string, limit: number) {
 
   const ua =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
-  const commonHeaders = {
+  const headers = {
     Accept: "application/json",
     "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
     "User-Agent": ua,
@@ -84,15 +82,15 @@ async function fetchScielo(q: string, limit: number) {
   } as const;
 
   try {
-    // Tentativa principal
-    let r = await fetch(url, { headers: commonHeaders, cache: "no-store" });
+    // tentativa principal
+    let r = await fetch(url, { headers, cache: "no-store" });
 
-    // Fallback se tomar 403 (alguns pops pedem outro endpoint)
+    // fallback se 403 em alguns PoPs
     if (r.status === 403) {
-      const fallback = `https://search.scielo.org/?q=${encodeURIComponent(
+      const fb = `https://search.scielo.org/?q=${encodeURIComponent(
         q
       )}&lang=pt&count=${limit}&format=json`;
-      r = await fetch(fallback, { headers: commonHeaders, cache: "no-store" });
+      r = await fetch(fb, { headers, cache: "no-store" });
     }
 
     if (!r.ok) return { items: [] as Item[], error: `scielo_${r.status}` };
@@ -117,9 +115,9 @@ async function fetchScielo(q: string, limit: number) {
   }
 }
 
-/* =========================
+/* =====================================
    LexML (SRU + MODS)
-   ========================= */
+   ===================================== */
 function parseLexml(xml: string, limit: number): Item[] {
   const out: Item[] = [];
   const rec = /<record\b[\s\S]*?<\/record>/gi;
@@ -152,10 +150,10 @@ async function fetchLexml(q: string, limit: number) {
   )}`;
 
   try {
-    // 1ª tentativa: HTTPS
+    // HTTPS
     let r = await fetch(`https://${base}`, { headers, cache: "no-store" });
 
-    // Fallback se status ruim: tentar HTTP
+    // fallback HTTP
     if (!r.ok) {
       try {
         r = await fetch(`http://${base}`, { headers, cache: "no-store" });
@@ -171,9 +169,101 @@ async function fetchLexml(q: string, limit: number) {
   }
 }
 
-/* =========================
+/* =====================================
+   Semantic Scholar (Graph API v1)
+   ===================================== */
+async function fetchSemanticScholar(q: string, limit: number) {
+  const base = "https://api.semanticscholar.org/graph/v1";
+  const fields = [
+    "title",
+    "year",
+    "url",
+    "abstract",
+    "authors.name",
+    "externalIds",
+  ].join(",");
+  const url = `${base}/paper/search?query=${encodeURIComponent(
+    q
+  )}&limit=${limit}&fields=${fields}`;
+
+  const headers: Record<string, string> = {
+    Accept: "application/json",
+  };
+  // se tiver chave, envia
+  if (process.env.SEMANTIC_SCHOLAR_API_KEY) {
+    headers["x-api-key"] = process.env.SEMANTIC_SCHOLAR_API_KEY;
+  }
+
+  try {
+    const r = await fetch(url, { headers, cache: "no-store" });
+    if (!r.ok) return { items: [] as Item[], error: `s2_${r.status}` };
+
+    const j: any = await r.json();
+    const data = j?.data ?? j?.papers ?? [];
+
+    const items: Item[] = data.map((p: any) => ({
+      source: "s2",
+      title: p?.title ?? "",
+      url: p?.url ?? "",
+      year: Number(p?.year) || undefined,
+      authors: (p?.authors ?? []).map((a: any) => a?.name).filter(Boolean),
+      snippet: p?.abstract,
+      extra: { externalIds: p?.externalIds },
+    }));
+
+    return { items };
+  } catch (e: any) {
+    return { items: [] as Item[], error: `s2_err_${e?.message || "x"}` };
+  }
+}
+
+/* =====================================
+   Google Scholar via SerpAPI
+   ===================================== */
+async function fetchGoogleScholar(q: string, limit: number) {
+  const apiKey = process.env.SERPAPI_API_KEY;
+  if (!apiKey) {
+    // sem chave não dá pra usar SerpAPI
+    return { items: [] as Item[], error: "scholar_missing_api_key" };
+  }
+
+  const url = `https://serpapi.com/search.json?engine=google_scholar&q=${encodeURIComponent(
+    q
+  )}&num=${limit}&api_key=${apiKey}`;
+
+  try {
+    const r = await fetch(url, { cache: "no-store" });
+    if (!r.ok) return { items: [] as Item[], error: `scholar_${r.status}` };
+
+    const j: any = await r.json();
+    const results = j?.organic_results ?? [];
+
+    const items: Item[] = results.slice(0, limit).map((d: any) => {
+      const pub = d?.publication_info?.summary || "";
+      const year = Number((pub.match(/(19|20)\d{2}/) || [])[0]) || undefined;
+      // autores aparecem misturados na summary; melhor não inventar muito
+      return {
+        source: "scholar",
+        title: d?.title ?? "",
+        url: d?.link ?? "",
+        year,
+        authors: undefined,
+        snippet: d?.snippet ?? pub,
+        extra: {
+          cited_by: d?.inline_links?.cited_by?.total ?? undefined,
+        },
+      };
+    });
+
+    return { items };
+  } catch (e: any) {
+    return { items: [] as Item[], error: `scholar_err_${e?.message || "x"}` };
+  }
+}
+
+/* =====================================
    Handler
-   ========================= */
+   ===================================== */
 export async function GET(req: NextRequest) {
   try {
     const { searchParams } = new URL(req.url);
@@ -191,6 +281,8 @@ export async function GET(req: NextRequest) {
     if (src === "all" || src === "openalex") tasks.push(fetchOpenAlex(q, limit));
     if (src === "all" || src === "scielo") tasks.push(fetchScielo(q, limit));
     if (src === "all" || src === "lexml") tasks.push(fetchLexml(q, limit));
+    if (src === "all" || src === "s2" || src === "semanticscholar") tasks.push(fetchSemanticScholar(q, limit));
+    if (src === "all" || src === "scholar" || src === "google_scholar") tasks.push(fetchGoogleScholar(q, limit));
 
     const results = await Promise.all(tasks);
     const items = results.flatMap((r) => r.items);
@@ -201,7 +293,6 @@ export async function GET(req: NextRequest) {
       { headers: { "Cache-Control": "no-store" } }
     );
   } catch (e: any) {
-    // Nunca mostra tela branca; sempre responde JSON
     return NextResponse.json(
       { ok: false, error: `fatal_${e?.message || "unknown"}` },
       { status: 500 }
