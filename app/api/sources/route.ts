@@ -5,9 +5,8 @@ import { fetchOpenAlex, fetchSciELO, fetchLexML } from "@/lib/utils";
 export const dynamic = "force-dynamic";
 export const runtime = "edge";
 
-// ------- Tipos -------
 type SourceItem = {
-  source: "openalex" | "scielo" | "lexml" | "semanticscholar";
+  source: "openalex" | "scielo" | "lexml";
   title: string;
   url?: string;
   doi?: string;
@@ -17,188 +16,129 @@ type SourceItem = {
   extra?: Record<string, any>;
 };
 
-type AggregatedResponse = {
+type ApiResponse = {
   query: string;
   items: SourceItem[];
 };
 
-// ------- Mapeadores -------
-
-// OpenAlex
-function mapOpenAlex(json: any): SourceItem[] {
-  const results: any[] = Array.isArray(json?.results) ? json.results : [];
-  return results.map((w) => {
-    const doi = w?.doi || undefined;
-    const year = w?.publication_year || undefined;
-    const oa = w?.open_access?.oa_url;
-    const src = w?.primary_location?.source?.url;
-    const url = oa || src || (doi ? `https://doi.org/${doi}` : undefined);
-    const authors =
-      Array.isArray(w?.authorships)
-        ? w.authorships.map((a: any) => a?.author?.display_name).filter(Boolean)
-        : undefined;
-
-    return {
-      source: "openalex",
-      title: w?.display_name ?? "(sem título)",
-      url,
-      doi,
-      year,
-      authors,
-      abstract: w?.abstract,
-      extra: {
-        cited_by_count: w?.cited_by_count,
-        openalex_id: w?.id,
-      },
-    };
-  });
+function mapOpenAlex(data: any, limit: number): SourceItem[] {
+  const arr: any[] = Array.isArray(data?.results) ? data.results : [];
+  return arr.slice(0, limit).map((w) => ({
+    source: "openalex",
+    title: w?.display_name ?? w?.title ?? "(sem título)",
+    url:
+      w?.primary_location?.source?.homepage_url ||
+      w?.open_access?.oa_url ||
+      w?.id,
+    doi: w?.doi ?? undefined,
+    year: w?.publication_year ?? undefined,
+    authors:
+      (w?.authorships || [])
+        .map((a: any) => a?.author?.display_name)
+        .filter(Boolean) || [],
+  }));
 }
 
-// SciELO ArticleMeta
-function mapSciELO(json: any): SourceItem[] {
-  const objects: any[] = Array.isArray(json) ? json : (Array.isArray(json?.objects) ? json.objects : []);
-  return objects.map((obj: any) => {
-    const title =
-      obj?.title || obj?.article_title || obj?.titles?.[0]?.title || "(sem título)";
-
-    const year =
-      Number(obj?.publication_year) ||
-      Number(obj?.year) ||
-      (obj?.publication_date ? Number(String(obj.publication_date).slice(0, 4)) : undefined);
-
-    const doi = obj?.doi || obj?.article_doi;
-    const url =
-      obj?.url || obj?.html_url || (doi ? `https://doi.org/${doi}` : undefined);
-
-    const authors =
-      Array.isArray(obj?.authors)
-        ? obj.authors
-            .map((a: any) => a?.name || [a?.given_names, a?.surname].filter(Boolean).join(" "))
-            .filter(Boolean)
-        : undefined;
-
-    const abstract =
-      obj?.abstract ||
-      (Array.isArray(obj?.abstracts) ? obj.abstracts[0]?.text : undefined);
-
-    return {
-      source: "scielo",
-      title,
-      url,
-      doi,
-      year: Number.isFinite(year) ? year : undefined,
-      authors,
-      abstract,
-      extra: {
-        scielo_pid: obj?.pid || obj?.article_pid,
-        collection: obj?.collection,
-        journal: obj?.source || obj?.journal?.title,
-      },
-    };
-  });
+function mapSciELO(data: any, limit: number): SourceItem[] {
+  const arr: any[] = Array.isArray(data?.objects) ? data.objects : Array.isArray(data) ? data : [];
+  return arr.slice(0, limit).map((a) => ({
+    source: "scielo",
+    title:
+      a?.titles?.[0]?.title ||
+      a?.title ||
+      a?.article_title ||
+      "(sem título)",
+    url:
+      a?.links?.[0]?.url ||
+      a?.link ||
+      a?.url ||
+      (a?.pid ? `https://search.scielo.org/?q=${encodeURIComponent(a?.pid)}` : undefined),
+    doi: a?.doi ?? undefined,
+    year: a?.publication_year ?? a?.year ?? undefined,
+    authors:
+      (a?.authors || a?.contrib || [])
+        .map((au: any) =>
+          au?.surname
+            ? `${au?.given_names ?? ""} ${au?.surname}`.trim()
+            : au?.name
+        )
+        .filter(Boolean) || [],
+    abstract:
+      a?.abstract ||
+      a?.abstracts?.[0]?.text ||
+      undefined,
+    extra: { scielo_pid: a?.pid ?? a?.scielo_pid },
+  }));
 }
 
-// LexML SRU (XML)
-function mapLexML(xml: string): SourceItem[] {
-  const records = xml.split(/<\/record>\s*/i).filter((seg) => seg.includes("<record"));
+function decodeHtml(s?: string) {
+  return (s ?? "")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&amp;/g, "&")
+    .replace(/&#34;/g, '"')
+    .replace(/&#39;/g, "'");
+}
+
+function mapLexML(xml: string, limit: number): SourceItem[] {
   const items: SourceItem[] = [];
-
-  for (const r of records) {
-    const get = (tag: string) => {
-      const m = r.match(new RegExp(`<${tag}[^>]*>([\\s\\S]*?)<\\/${tag}>`, "i"));
-      return m ? m[1].trim() : undefined;
-    };
-    const title = get("dc:title") || get("title") || "(sem título)";
-    const id = get("dc:identifier") || get("identifier");
-    const dateStr = get("dc:date") || get("date");
-    const year = dateStr ? Number(String(dateStr).slice(0, 4)) : undefined;
-    const url = id && /^https?:\/\//i.test(id) ? id : undefined;
-
+  const re =
+    /<recordData>[\s\S]*?<title>(.*?)<\/title>[\s\S]*?(?:<identifier[^>]*>(.*?)<\/identifier>)?/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(xml)) && items.length < limit) {
     items.push({
       source: "lexml",
-      title,
-      url,
-      year: Number.isFinite(year) ? year : undefined,
-      extra: { identifier: id, rawDate: dateStr },
+      title: decodeHtml(m[1]) || "(sem título)",
+      url: m[2] ? decodeHtml(m[2]) : undefined,
     });
   }
-
   return items;
 }
 
-// Semantic Scholar (S2)
-async function fetchSemanticScholar(query: string) {
-  const fields = "title,authors,year,abstract,doi,url";
-  const url = `https://api.semanticscholar.org/graph/v1/paper/search?query=${encodeURIComponent(
-    query
-  )}&limit=5&fields=${fields}`;
-  const headers: Record<string, string> = { Accept: "application/json" };
-  if (process.env.S2_API_KEY) headers["x-api-key"] = process.env.S2_API_KEY!;
-  const res = await fetch(url, { headers, cache: "no-store" });
-  if (!res.ok) throw new Error("Erro no Semantic Scholar");
-  return res.json();
-}
-
-function mapSemanticScholar(json: any): SourceItem[] {
-  const data: any[] = Array.isArray(json?.data) ? json.data : [];
-  return data.map((p) => {
-    const doi = p?.doi || undefined;
-    const url = p?.url || (doi ? `https://doi.org/${doi}` : undefined);
-    const authors = Array.isArray(p?.authors)
-      ? p.authors.map((a: any) => a?.name).filter(Boolean)
-      : undefined;
-    return {
-      source: "semanticscholar",
-      title: p?.title ?? "(sem título)",
-      url,
-      doi,
-      year: p?.year ?? undefined,
-      authors,
-      abstract: p?.abstract,
-    };
-  });
-}
-
-// ------- Agregador -------
-async function runAggregation(query: string): Promise<AggregatedResponse> {
-  const items: SourceItem[] = [];
-
-  try { const oa = await fetchOpenAlex(query); items.push(...mapOpenAlex(oa)); } catch {}
-  try { const sc = await fetchSciELO(query); items.push(...mapSciELO(sc)); } catch {}
-  try { const xml = await fetchLexML(query); items.push(...mapLexML(xml)); } catch {}
-  try { const s2 = await fetchSemanticScholar(query); items.push(...mapSemanticScholar(s2)); } catch {}
-
-  const dedup = new Map<string, SourceItem>();
-  for (const it of items) {
-    const key = (it.doi?.toLowerCase() ?? "") || it.title.toLowerCase();
-    if (!dedup.has(key)) dedup.set(key, it);
-  }
-  return { query, items: Array.from(dedup.values()) };
-}
-
-// ------- Handlers -------
-export async function POST(req: NextRequest) {
-  try {
-    const body = await req.json().catch(() => ({}));
-    const query = (body?.query ?? "").toString().trim();
-    if (!query) {
-      return NextResponse.json({ error: "Informe 'query' no corpo da requisição." }, { status: 400 });
-    }
-    const data = await runAggregation(query);
-    return NextResponse.json(data, { status: 200 });
-  } catch {
-    return NextResponse.json({ error: "Erro interno ao agregar fontes." }, { status: 500 });
-  }
-}
-
 export async function GET(req: NextRequest) {
-  const { searchParams } = new URL(req.url);
-  const q = (searchParams.get("q") ?? "").trim();
-  if (!q) return NextResponse.json({ error: "Use ?q=termo para testar." }, { status: 400 });
   try {
-    const data = await runAggregation(q);
-    return NextResponse.json(data, { status: 200 });
+    const { searchParams } = new URL(req.url);
+    const q = (searchParams.get("q") || "").trim();
+    const source = (searchParams.get("source") || "all").toLowerCase();
+    const limit = Math.min(
+      Math.max(parseInt(searchParams.get("limit") || "5", 10), 1),
+      10
+    );
+
+    if (!q) {
+      return NextResponse.json(
+        { error: "Passe o parâmetro ?q= com o termo da busca." },
+        { status: 400 }
+      );
+    }
+
+    const tasks: Promise<SourceItem[]>[] = [];
+
+    if (source === "openalex" || source === "all") {
+      tasks.push(
+        fetchOpenAlex(q).then((d: any) => mapOpenAlex(d, limit)).catch(() => [])
+      );
+    }
+    if (source === "scielo" || source === "all") {
+      tasks.push(
+        fetchSciELO(q).then((d: any) => mapSciELO(d, limit)).catch(() => [])
+      );
+    }
+    if (source === "lexml" || source === "all") {
+      tasks.push(
+        fetchLexML(q).then((xml: string) => mapLexML(xml, limit)).catch(() => [])
+      );
+    }
+
+    const settled = await Promise.allSettled(tasks);
+    const items = settled.flatMap((r) => (r.status === "fulfilled" ? r.value : []));
+
+    const payload: ApiResponse = { query: q, items };
+    return NextResponse.json(payload, { status: 200 });
   } catch {
-    return NextResponse.json({ error: "Erro interno ao agregar fontes." }, { status: 500 });
+    return NextResponse.json(
+      { error: "Falha ao processar a busca." },
+      { status: 500 }
+    );
   }
 }
